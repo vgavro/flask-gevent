@@ -1,9 +1,12 @@
 import atexit
+import sys
 
+from flask import current_app
+from werkzeug.utils import import_string
 import gevent
 import gevent.pool
 
-from .decorators import app_context
+from .utils import app_context
 
 
 def atexit_register(func):
@@ -28,21 +31,41 @@ def atexit_register(func):
         atexit.register(func)
 
 
+def _maybe_import(value):
+    return import_string(value) if isinstance(value, str) else value
+
+
+def _run_forever(self, sleep=0, exit_on_error=True):
+    def decorator(func):
+        def wrapper():
+            while True:
+                try:
+                    func()
+                except Exception as exc:
+                    current_app.logger.exception('%r failed: %r', func, exc)
+                    if exit_on_error:
+                        print('%r failed: %r' % (func, exc), file=sys.stderr)
+                        return sys.exit(1)
+                if sleep:
+                    current_app.logger.debug('%s sleeping for %s seconds', func, sleep)
+                    gevent.sleep(sleep)
+        return func
+    return decorator
+
+
 class GeventLifecycle:
-    app = None
-
-    def __init__(self, app=None):
-        self._signal, self._exit, self._run = [], [], []
-        if app:
-            self.init_app(app)
-
-    def init_app(self, app):
-        if self.app:
-            raise RuntimeError('GeventLifecycle instance can be registered only once per app')
+    def __init__(self, app, signal=[], exit=[], run=[], run_forever=[]):
         self.app = app
         self.pool = gevent.pool.Pool()
+
+        self._signal = [(_maybe_import(func), *args) for func, *args in signal]
+        self._exit = [_maybe_import(func) for func in exit]
+        self._run = (
+            [_maybe_import(func) for func in run]
+            + [_run_forever(*args)(_maybe_import(func))
+               for func, *args in run_forever]
+        )
         self._bind()
-        # app.extensions['gevent_lifecycle'] = self
 
     def _bind(self):
         # This may run more than once because of registering
@@ -58,29 +81,25 @@ class GeventLifecycle:
         self._run.clear()
         self._exit.clear()
 
-    def _maybe_bind(self):
-        if self.app:
-            self._bind()
-
-    def signal(self, signalnum, *signalnums):
+    def signal(self, signalnums):
         def decorator(func):
-            self._signal.append(func, frozenset((signalnum,) + signalnums))
-            self._maybe_bind()
+            self._signal.append(func, frozenset(signalnums))
+            self._bind()
             return func
         return decorator
 
     def exit(self, func):
         self._exit.append(func)
-        self._maybe_bind()
+        self._bind()
         return func
 
     def run(self, func):
         self._run.append(func)
-        self._maybe_bind()
+        self._bind()
         return func
 
-    def run_forever(self, sleep=0):
+    def run_forever(self, sleep=0, exit_on_error=True):
         def decorator(func):
-            self.run(run_forever(sleep)(func))
+            self.run(_run_forever(sleep, exit_on_error)(func))
             return func
         return decorator

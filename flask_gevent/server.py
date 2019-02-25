@@ -8,7 +8,8 @@ import gevent.pywsgi
 
 def serve_forever(app, **kwargs):
     def get_config(name, default):
-        return kwargs.pop(name, app.config.get('GEVENT_SERVER_%s' % name.upper(), default))
+        return kwargs.pop(name, app.config.get('GEVENT_SERVER_%s' % name.upper(),
+                                               default))
 
     host, port = get_config('listen', '127.0.0.1:8088').split(':')
     exit_signals = get_config('exit_signals', [signal.SIGTERM, signal.SIGINT])
@@ -19,13 +20,14 @@ def serve_forever(app, **kwargs):
     # log = get_config('log', app.logger)
     # error_log = get_config('error_log', app.logger)
 
-    pools, lifecycle = app.extensions['gevent'].pools, app.extensions['gevent'].lifecycle
+    pools = app.extensions['gevent'].pools
+    lifecycle = app.extensions['gevent'].lifecycle
 
     if isinstance(spawn, gevent.pool.Pool):
         pools['_server'] = spawn
 
-    server = gevent.pywsgi.WSGIServer((host, int(port)), app,
-        spawn=spawn, **kwargs)
+    server = gevent.pywsgi.WSGIServer(
+        (host, int(port)), app, spawn=spawn, **kwargs)
 
     def exit():
         if hasattr(exit, 'exiting'):

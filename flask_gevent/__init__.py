@@ -1,11 +1,9 @@
-from copy import copy
-
 import gevent
 import gevent.greenlet
 import gevent.pool
 from flask import current_app
 
-from .decorators import app_context
+from .utils import app_context, repr_pool_status
 from .lifecycle import GeventLifecycle
 
 
@@ -19,10 +17,22 @@ class Greenlet(gevent.greenlet.Greenlet):
 
 class Group(gevent.pool.Group):
     greenlet_class = Greenlet
+    __str__ = repr_pool_status
 
 
 class Pool(gevent.pool.Pool):
     greenlet_class = Greenlet
+    __str__ = repr_pool_status
+
+
+class _GeventState(object):
+    def __init__(self, gevent, pools, lifecycle):
+        self.gevent = gevent
+        self.pools = pools
+        self.lifecycle = lifecycle
+
+    def __getattr__(self, name):
+        return getattr(self.gevent, name)
 
 
 class Gevent(object):
@@ -34,38 +44,25 @@ class Gevent(object):
         via :meth:`init_app`.
     """
     app = None
-    pools = None
     pool_class = Pool
     greenlet_class = Greenlet
 
-    def __init__(self, app=None, **options):
-        self.lifecycle = GeventLifecycle()
-        if app is not None:
-            self.init_app(app, **options)
-        elif options:
-            raise TypeError('You can pass **options only on app initialization')
-
-    def init_app(self, app, pools={}, lifecycle=True):
-        if self.app is not None:
-            raise RuntimeError('Gevent instance can be registered only once per app')
+    def __init__(self, app=None):
         self.app = app
+        if app is not None:
+            self.init_app(app)
 
-        # em... do we really need this bind?
-        self.greenlet_class = copy(self.greenlet_class)
-        self.greenlet_class._app = app
-        self.pool_class.greenlet_class = self.greenlet_class
-
-        self.pools = {
+    def init_app(self, app, pools={}, **lifecycle):
+        pools = {
             name: (
                 pool if isinstance(pool, gevent.pool.Group)
                 else self.pool_class(**{'greenlet_class': self.greenlet_class, **pool})
             )
-            for name, pool in pools.items()
+            for name, pool in {**app.conf.get('GEVENT_POOLS', {}), **pools}.items()
         }
-        app.extensions['gevent'] = self
-        if lifecycle:
-            self.lifecycle.init_app(app)
-        return self
+        lifecycle = {**app.conf.get('GEVENT_LIFECYCLE', {}), **lifecycle}
+        app.extensions['gevent'] = _GeventState(self, pools,
+                                                GeventLifecycle(app, **lifecycle))
 
     def _get_app(self):
         if current_app:
@@ -81,7 +78,8 @@ class Gevent(object):
         return self.greenlet_class.spawn(self.app_context()(func), *args, **kwargs)
 
     def spawn_later(self, seconds, func, *args, **kwargs):
-        return self.greenlet_class.spawn_later(seconds, self.app_context()(func), *args, **kwargs)
+        return self.greenlet_class.spawn_later(seconds, self.app_context()(func),
+                                               *args, **kwargs)
 
     def spawn_raw(self, func, *args, **kwargs):
         return gevent.spawn_raw(self.app_context()(func), *args, **kwargs)
@@ -90,8 +88,10 @@ class Gevent(object):
         return gevent.signal_handler(signalnum, self.app_context()(handler),
                                      *args, **kwargs)
 
-    # Lifecycle decorators
-    signal = property(lambda self: self.lifecycle.signal)
-    exit = property(lambda self: self.lifecycle.exit)
-    run = property(lambda self: self.lifecycle.run)
-    run_forever = property(lambda self: self.lifecycle.run_forever)
+    @property
+    def pools(self):
+        self._get_app().extensions['gevent'].pools
+
+    @property
+    def lifecycle(self):
+        self._get_app().extensions['gevent'].lifecycle
