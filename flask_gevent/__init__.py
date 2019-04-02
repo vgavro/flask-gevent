@@ -2,6 +2,7 @@ import gevent
 import gevent.greenlet
 import gevent.pool
 from flask import current_app
+from werkzeug.local import LocalProxy
 
 from .utils import app_context, repr_pool_status
 from .lifecycle import GeventLifecycle
@@ -43,14 +44,15 @@ class Gevent(object):
         application is provided on creation, then it can be provided later on
         via :meth:`init_app`.
     """
-    app = None
     pool_class = Pool
     greenlet_class = Greenlet
 
-    def __init__(self, app=None):
+    def __init__(self, app=None, **options):
         self.app = app
         if app is not None:
-            self.init_app(app)
+            self.init_app(app, **options)
+        elif options:
+            raise TypeError('options passed without app')
 
     def init_app(self, app, pools={}, **lifecycle):
         pools = {
@@ -58,9 +60,9 @@ class Gevent(object):
                 pool if isinstance(pool, gevent.pool.Group)
                 else self.pool_class(**{'greenlet_class': self.greenlet_class, **pool})
             )
-            for name, pool in {**app.conf.get('GEVENT_POOLS', {}), **pools}.items()
+            for name, pool in {**app.config.get('GEVENT_POOLS', {}), **pools}.items()
         }
-        lifecycle = {**app.conf.get('GEVENT_LIFECYCLE', {}), **lifecycle}
+        lifecycle = {**app.config.get('GEVENT_LIFECYCLE', {}), **lifecycle}
         app.extensions['gevent'] = _GeventState(self, pools,
                                                 GeventLifecycle(app, **lifecycle))
 
@@ -91,6 +93,9 @@ class Gevent(object):
     @property
     def pools(self):
         self._get_app().extensions['gevent'].pools
+
+    def get_pool(self, name):
+        return LocalProxy(lambda: self.pools[name])
 
     @property
     def lifecycle(self):
