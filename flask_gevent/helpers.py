@@ -8,18 +8,6 @@ from gevent.lock import Semaphore, BoundedSemaphore
 from .utils import repr_pool_status
 
 
-def __link_greenlet(rv):
-    def __link_greenlet(entity_id):
-        def ___link_greenlet(greenlet):
-            if greenlet.successfull():
-                if greenlet.value is not None:
-                    rv[entity_id] = greenlet.value
-            else:
-                rv[entity_id] = greenlet.exception
-        return ___link_greenlet
-    return __link_greenlet
-
-
 class EntityBulkProcessor:
     # __call__ returns (data, errors), which are mappings by entity_id
     # if join_timeout expires and worker not finished, no entity_id in data or errors
@@ -52,24 +40,26 @@ class EntityBulkProcessor:
         join_timeout = self.join_timeout if join is True else int(join)
         join_raise = self.join_raise if join_raise is None else join_raise
 
+        rv = {}
         if update:
             timeout = Timeout.start_new(update_timeout)
-        rv = {}
         try:
-            workers = self._get_or_update(
+            rv_, workers = self._get_or_update(
                 entity_ids, update,
-                link=__link_greenlet(rv) if join_timeout else None)
+                link_factory=self._create_link_factory(rv) if join_timeout else None)
         except Timeout:
             self.logger.warning('Update timeout: %s', entity_ids)
             raise
         else:
+            rv.update(rv_)
             self.logger.debug(
-                'Processing: rv=%s spawned=%s pool=%s',
-                set(rv.keys()) or '{}',
-                [(w.args and w.args[0]) for w in workers],
+                'Processing: rv=%s update=%s spawned=%s pool=%s',
+                set(rv.keys()) or '{}', [(w.args and w.args[0]) for w in workers],
                 repr_pool_status(self.pool),
             )
-            timeout.cancel()  # TODO: api?
+        finally:
+            if update:
+                timeout.cancel()
 
         if workers and join:
             finished_workers = joinall(workers, timeout=join_timeout)
@@ -82,10 +72,8 @@ class EntityBulkProcessor:
                     'Join timeout: %d, not finished workers: %s',
                     join_timeout, entity_ids_)
                 if join_raise:
-                    raise RuntimeError('Join timeout exceeded', entity_ids_)
-            # Not needed with link
-            # rv_, _ = self._get_or_update(set(entity_ids) - set(rv), update=False)
-            # rv.update(rv_)
+                    raise RuntimeError('Join timeout exceeded',
+                                       join_timeout, entity_ids_)
 
         data, errors = {}, {}
         for entity_id, value in rv.items():
@@ -95,18 +83,33 @@ class EntityBulkProcessor:
                 data[entity_id] = value
         return data, errors
 
-    def _get_or_update(self, entity_ids, update, link=None):
+    def _create_link_factory(self, rv):
+        def _create_link(entity_id):
+            def _link_greenlet(greenlet):
+                if greenlet.successfull():
+                    if greenlet.value is not None:
+                        rv[entity_id] = greenlet.value
+                else:
+                    rv[entity_id] = greenlet.exception
+            return _link_greenlet
+        return _create_link
+
+    def _get_or_update(self, entity_ids, update, link_factory=None):
         rv, workers = self.getter(entity_ids), []
         if update:
             for entity_id in entity_ids.difference(rv.keys()):
-                workers.append(self.get_or_create_worker(entity_id, link))
+                workers.append(self.get_or_create_worker(
+                    entity_id, link_factory and link_factory(entity_id)))
         return rv, workers
 
     def get_or_create_worker(self, entity_id, link=None):
         if entity_id not in self.workers:
-            self.workers[entity_id] = self.pool.spawn(self.worker, entity_id)
+            self.pool.wait_available()
+            # For cases when several workers for same entity is waiting before spawn
+            if entity_id not in self.workers:
+                self.workers[entity_id] = self.pool.spawn(self.worker, entity_id)
         if link:
-            self.workers[entity_id].link(lambda: link(entity_id))
+            self.workers[entity_id].link(link)
         return self.workers[entity_id]
 
     def worker(self, entity_id):
@@ -173,9 +176,10 @@ class CacheEntityBulkProcessor:
 
 
 class SqlAlchemyEntityBulkProcessor:
-    def __init__(self, pool, model, id_field='id', **kwargs):
+    def __init__(self, pool, model, id_field='id', commit=False, **kwargs):
         self.model = model
         self.id_field = id_field
+        self.commit = commit
         super().__init__(pool, **kwargs)
 
     def getter(self, entity_ids):
@@ -186,9 +190,10 @@ class SqlAlchemyEntityBulkProcessor:
         }
 
     def on_value(self, entity_id, value):
-        db = current_app.extensions['sqlalchemy'].db
-        db.session.add(value)
-        db.session.commit()
+        if self.commit:
+            db = current_app.extensions['sqlalchemy'].db
+            db.session.add(value)
+            db.session.commit()
 
     def on_exception(self, entity_id, exc):
         pass
@@ -231,7 +236,7 @@ class LockedFactoryDict(UserDict):
 
 
 class Semaphore(Semaphore):
-    # TODO: looks like it's already implemented in newer gevent versions
+    # NOTE: looks like it's already implemented in newer gevent versions
     """Extends gevent.lock.Semaphore with context."""
     def __enter__(self):
         self.acquire()
