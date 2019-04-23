@@ -92,7 +92,7 @@ class Gevent(object):
 
     @property
     def pools(self):
-        self._get_app().extensions['gevent'].pools
+        return self._get_app().extensions['gevent'].pools
 
     def get_pool(self, name):
         return LocalProxy(lambda: self.pools[name])

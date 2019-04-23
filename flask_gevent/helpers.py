@@ -9,21 +9,11 @@ from .utils import repr_pool_status
 
 
 class EntityBulkProcessor:
-    # __call__ returns (data, errors), which are mappings by entity_id
-    # if join_timeout expires and worker not finished, no entity_id in data or errors
-    # i join_raise=True and join_timeout expires, RuntimeError is raised.
-    # worker may:
-    #   return value - on_value is triggered, data[entity_id] = value
-    #   return None - on_value is not triggered, no entity_id in data or errors
-    #   return Exception - on_exception is triggered, no traceback logged
-    #   raise Exception - on_exception is triggered, traceback logged
-
-    def __init__(self, pool, update_timeout=10, join_timeout=30,
-                 join_raise=False, worker=None, logger=None):
+    def __init__(self, pool, spawn_timeout=10, join_timeout=30,
+                 worker=None, logger=None):
         self.pool = pool
-        self.update_timeout = update_timeout
+        self.spawn_timeout = spawn_timeout
         self.join_timeout = join_timeout
-        self.join_raise = join_raise
         if worker:
             self._worker = worker
         self._logger = logger
@@ -34,46 +24,67 @@ class EntityBulkProcessor:
     def logger(self):
         return self._logger or current_app.logger
 
-    def __call__(self, *entity_ids, update=True, join=False, join_raise=None):
-        entity_ids = set(entity_ids)
-        update_timeout = self.update_timeout if update is True else int(update)
-        join_timeout = self.join_timeout if join is True else int(join)
-        join_raise = self.join_raise if join_raise is None else join_raise
+    def __call__(self, *entity_ids,
+                 spawn=True, spawn_timeout=None, spawn_raise=True,
+                 join=False, join_timeout=None, join_raise=True,
+                 as_dict=False):
+        # Returns (data, errors), which are mappings by entity_id
+        # spawn - starts worker for not found entity_id, skips otherwise
+        # spawn_timeout - maximum wait to spawn, if False - waits forever
+        # spawn_raise - raise Timeout on spawn_timeout
+        # join - wait for workers to finish
+        # join_timeout - maximum wait to finish, if False - waits forever
+        # join_raise - raise RuntimeError on join_timeout
+        # as_dict - return {data, errors} dict instead tuple
 
-        rv = {}
-        if update:
-            timeout = Timeout.start_new(update_timeout)
+        # worker may:
+        #   return value - on_value is triggered, data[entity_id] = value
+        #   return None - on_value is not triggered, no entity_id in data or errors
+        #   return Exception - on_exception is triggered, no traceback logged
+        #   raise Exception - on_exception is triggered, traceback logged
+
+        entity_ids = set(entity_ids)
+        spawn_timeout = self.spawn_timeout if spawn_timeout is None else spawn_timeout
+        join_timeout = self.join_timeout if join_timeout is None else join_timeout
+
+        timeout = None
+        if spawn and spawn_timeout is not False:
+            timeout = Timeout.start_new(spawn_timeout)
         try:
-            rv_, workers = self._get_or_update(
-                entity_ids, update,
-                link_factory=self._create_link_factory(rv) if join_timeout else None)
-        except Timeout:
-            self.logger.warning('Update timeout: %s', entity_ids)
-            raise
-        else:
-            rv.update(rv_)
-            self.logger.debug(
-                'Processing: rv=%s update=%s spawned=%s pool=%s',
-                set(rv.keys()) or '{}', [(w.args and w.args[0]) for w in workers],
-                repr_pool_status(self.pool),
-            )
+            rv, workers = self._get_or_spawn(
+                entity_ids, spawn, link=bool(join_timeout))
+        except Timeout as exc:
+            if exc is timeout:
+                self.logger.warning('Update timeout: %s %s', exc, entity_ids)
+                if spawn_raise:
+                    raise
+                rv, workers = self._get_or_spawn(entity_ids, False, False)
+            else:
+                raise
         finally:
-            if update:
+            if timeout:
                 timeout.cancel()
 
+        self.logger.debug(
+            'Processing: rv=%s spawned=%s pool=%s',
+            set(rv.keys()) or '{}', [(w.args and w.args[0]) for w in workers],
+            repr_pool_status(self.pool),
+        )
         if workers and join:
+            if join_timeout is not None and join_raise:
+                timeout = Timeout.start_new(spawn_timeout)
+
             finished_workers = joinall(workers, timeout=join_timeout)
             if len(workers) != len(finished_workers):
                 # w.args[0] is available only for not ready workers,
                 # it's cleared otherwise
-                entity_ids_ = [w.args[0] for w
-                               in set(workers).difference(finished_workers)]
+                args = [w.args for w in set(workers).difference(finished_workers)]
                 self.logger.warning(
                     'Join timeout: %d, not finished workers: %s',
-                    join_timeout, entity_ids_)
+                    join_timeout, args)
                 if join_raise:
                     raise RuntimeError('Join timeout exceeded',
-                                       join_timeout, entity_ids_)
+                                       join_timeout, args)
 
         data, errors = {}, {}
         for entity_id, value in rv.items():
@@ -81,54 +92,60 @@ class EntityBulkProcessor:
                 errors[entity_id] = value
             else:
                 data[entity_id] = value
+        if as_dict:
+            return {'data': data, 'errors': errors}
         return data, errors
 
-    def _create_link_factory(self, rv):
-        def _create_link(entity_id):
-            def _link_greenlet(greenlet):
-                if greenlet.successfull():
-                    if greenlet.value is not None:
-                        rv[entity_id] = greenlet.value
-                else:
-                    rv[entity_id] = greenlet.exception
-            return _link_greenlet
-        return _create_link
-
-    def _get_or_update(self, entity_ids, update, link_factory=None):
+    def _get_or_spawn(self, entity_ids, spawn, link=False):
         rv, workers = self.getter(entity_ids), []
-        if update:
-            for entity_id in entity_ids.difference(rv.keys()):
-                workers.append(self.get_or_create_worker(
-                    entity_id, link_factory and link_factory(entity_id)))
+        for entity_id in entity_ids.difference(rv.keys()):
+            worker = self.workers.get(entity_id)
+            if not worker and spawn:
+                worker = self._spawn_worker(entity_id, (entity_id,))
+            if worker:
+                if link:
+                    worker.link(self._create_link(rv, entity_id))
+                workers.append(worker)
         return rv, workers
 
-    def get_or_create_worker(self, entity_id, link=None):
+    def _create_link(self, rv, entity_id):
+        def _link_greenlet(greenlet):
+            if greenlet.successful():
+                if greenlet.value is not None:
+                    rv[entity_id] = greenlet.value
+            else:
+                rv[entity_id] = greenlet.exception
+        return _link_greenlet
+
+    def _spawn_worker(self, entity_id, args=(), kwargs={}):
+        self.pool.wait_available()
+        # For cases when several workers for same entity is waiting before spawn
         if entity_id not in self.workers:
-            self.pool.wait_available()
-            # For cases when several workers for same entity is waiting before spawn
-            if entity_id not in self.workers:
-                self.workers[entity_id] = self.pool.spawn(self.worker, entity_id)
-        if link:
-            self.workers[entity_id].link(link)
+            self.workers[entity_id] = self.pool.spawn(
+                self.worker, entity_id, args, kwargs)
         return self.workers[entity_id]
 
-    def worker(self, entity_id):
-        self.logger.debug('Starting worker: %s', entity_id)
+    def worker(self, entity_id, args, kwargs):
+        self.logger.debug('Starting worker: %s %s %s', entity_id, args, kwargs)
         try:
-            rv = self._worker(entity_id)
+            rv = self._worker(*args, **kwargs)
         except Exception as exc:
-            self.logger.exception('Worker failed: %s %r', entity_id, exc)
+            self.logger.exception('Worker failed: %s %s %s %r',
+                                  entity_id, args, kwargs, exc)
             self.on_exception(entity_id, exc)
         except BaseException as exc:
-            self.logger.debug('Worker failed: %s %r', entity_id, exc)
+            self.logger.debug('Worker failed: %s %s %s %r',
+                              entity_id, args, kwargs, exc)
             raise
         else:
             if isinstance(rv, Exception):
                 # Allowing returning error not to print traceback
-                self.logger.warning('Worker failed: %s %r', entity_id, rv)
+                self.logger.warning('Worker failed: %s %s %s %r',
+                                    entity_id, args, kwargs, rv)
                 self.on_exception(entity_id, rv)
             elif rv is not None:
                 self.on_value(entity_id, rv)
+            return rv
         finally:
             del self.workers[entity_id]
 
@@ -145,12 +162,10 @@ class EntityBulkProcessor:
         raise NotImplementedError()
 
 
-class CacheEntityBulkProcessor:
-    def __init__(self, pool, cache, cache_key, cache_timeout, cache_exception_timeout,
+class CacheEntityBulkProcessor(EntityBulkProcessor):
+    def __init__(self, pool, cache, cache_timeout, cache_exception_timeout,
                  **kwargs):
         self.cache = cache
-        assert '{}' in cache_key, 'Cache key should have format placeholder'
-        self.cache_key = cache_key
         self.cache_timeout = cache_timeout
         self.cache_exception_timeout = cache_exception_timeout
         super().__init__(pool, **kwargs)
@@ -158,24 +173,23 @@ class CacheEntityBulkProcessor:
     def getter(self, entity_ids):
         rv = {}
         for entity_id in entity_ids:
-            data = self.cache.get(self.cache_key.format(entity_id))
+            data = self.cache.get(entity_id)
             if data is not None:
                 rv[entity_id] = data
         return rv
 
     def on_value(self, entity_id, value):
-        self.cache.set(self.cache_key.format(entity_id), value, self.cache_timeout)
+        self.cache.set(entity_id, value, self.cache_timeout)
 
     def on_exception(self, entity_id, exc):
         if self.cache_exception_timeout:
-            self.cache.set(self.cache_key.format(entity_id), exc,
-                           self.cache_exception_timeout)
+            self.cache.set(entity_id, exc, self.cache_exception_timeout)
 
     def _worker(self, entity_id):
         raise NotImplementedError()
 
 
-class SqlAlchemyEntityBulkProcessor:
+class SqlAlchemyEntityBulkProcessor(EntityBulkProcessor):
     def __init__(self, pool, model, id_field='id', commit=False, **kwargs):
         self.model = model
         self.id_field = id_field
